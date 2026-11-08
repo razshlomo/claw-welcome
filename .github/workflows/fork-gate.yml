@@ -1,0 +1,126 @@
+name: One-off fork gate (fbb9d10c)
+
+on:
+  push:
+    branches: [oneoff/fork-gate-fbb9d10c]
+
+permissions:
+  contents: read
+
+env:
+  FORK_REPO: razshlomo/openclaw
+  BASE_SHA: c556fc03157abd76241987a1d62c2882ccc14948
+
+jobs:
+  static:
+    name: static (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, base]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Apply the change under test
+        if: matrix.variant == 'patched'
+        working-directory: fork
+        run: |
+          git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
+          git log --oneline -3
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fork/package.json
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Install
+        working-directory: fork
+        run: pnpm install --frozen-lockfile
+      - name: tsgo core
+        id: tsgo_core
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm tsgo:core
+      - name: tsgo extensions
+        id: tsgo_extensions
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm tsgo:extensions
+      - name: lint
+        id: lint
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm lint
+      - name: focused tests
+        id: focused
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm test src/infra/sqlite-worker-broker.test.ts src/infra/sqlite-worker-broker-lifecycle.test.ts extensions/workboard/src
+      - name: build
+        id: build
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm build
+      - name: Summary
+        run: |
+          {
+            echo "## static (${{ matrix.variant }})"
+            echo "| step | outcome |"
+            echo "|---|---|"
+            echo "| tsgo:core | ${{ steps.tsgo_core.outcome }} |"
+            echo "| tsgo:extensions | ${{ steps.tsgo_extensions.outcome }} |"
+            echo "| lint | ${{ steps.lint.outcome }} |"
+            echo "| focused tests | ${{ steps.focused.outcome }} |"
+            echo "| build | ${{ steps.build.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for outcome in "${{ steps.tsgo_core.outcome }}" "${{ steps.tsgo_extensions.outcome }}" "${{ steps.lint.outcome }}" "${{ steps.focused.outcome }}" "${{ steps.build.outcome }}"; do
+            [ "$outcome" = "success" ] || exit 1
+          done
+
+  test:
+    name: full test (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, base]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Apply the change under test
+        if: matrix.variant == 'patched'
+        working-directory: fork
+        run: git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fork/package.json
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Install
+        working-directory: fork
+        run: pnpm install --frozen-lockfile
+      - name: pnpm test
+        working-directory: fork
+        run: pnpm test

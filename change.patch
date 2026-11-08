@@ -1,0 +1,202 @@
+From 3d703ece1eab1a41de16721a7a9996f1986593db Mon Sep 17 00:00:00 2001
+From: "yehezkel-assistant[bot]"
+ <3902212+yehezkel-assistant[bot]@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 09:25:33 +0200
+Subject: [PATCH 1/2] fix(sqlite-worker): retire a failed actor before
+ reopening (temporary, completes backport of #170138)
+
+c0ba37ed20 ported only the sqlite-store.ts half of #170138, so a Workboard
+facade reopened onto the same actor whenever another client still retained it.
+That actor stays in the broker map and rethrows its slot failure, so board
+writes kept failing with "database is locked" until a gateway restart
+(1.11.2026 and 7.11.2026). Silent sibling facades hold exactly that reference.
+
+Retire the failed actor before reopening, as upstream 069d40e40c does. Adds a
+recovery test with a silent sibling, and a guard that one real SQLite lock does
+not reopen the store.
+
+TEMPORARY: remove once we run a release containing openclaw/openclaw#170138
+(first in v2026.10.10-beta.1), together with c0ba37ed20.
+---
+ .../src/sqlite-store.recovery.test.ts         | 75 +++++++++++++++++++
+ src/infra/sqlite-worker-broker.ts             |  5 ++
+ 2 files changed, 80 insertions(+)
+ create mode 100644 extensions/workboard/src/sqlite-store.recovery.test.ts
+
+diff --git a/extensions/workboard/src/sqlite-store.recovery.test.ts b/extensions/workboard/src/sqlite-store.recovery.test.ts
+new file mode 100644
+index 00000000..426a8002
+--- /dev/null
++++ b/extensions/workboard/src/sqlite-store.recovery.test.ts
+@@ -0,0 +1,75 @@
++import assert from "node:assert/strict";
++import { mkdtemp, rm } from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { DatabaseSync } from "node:sqlite";
++import { Worker } from "node:worker_threads";
++import { expect, it, vi } from "vitest";
++import { createWorkboardSqliteStores } from "./sqlite-store.js";
++
++const workerModuleUrl = new URL("./sqlite-store.worker.ts", import.meta.url);
++const board = {
++  version: 1 as const,
++  board: { id: "ops", name: "Operations", createdAt: 1, updatedAt: 1 },
++};
++
++// This facade checks availability after a failure, so the call that observes the dead slot rejects.
++async function afterAtMostOneRejection<T>(call: () => Promise<T>): Promise<T> {
++  try {
++    return await call();
++  } catch {
++    return call();
++  }
++}
++
++it("recovers Workboard after its slot fails with a silent sibling retaining the actor", async () => {
++  const dir = await mkdtemp(path.join(os.tmpdir(), "workboard-recovery-"));
++  const dbPath = path.join(dir, "workboard.sqlite");
++  const capture = vi.spyOn(Worker.prototype, "postMessage");
++  const stores = createWorkboardSqliteStores({ dbPath, workerModuleUrl });
++  const sibling = createWorkboardSqliteStores({ dbPath, workerModuleUrl });
++  try {
++    await Promise.all([stores.ready, sibling.ready]);
++    await stores.boards.register("ops", board);
++    const openRequestIndex = capture.mock.calls.findIndex(
++      ([request]) => request?.type === "open" && request.databasePath === dbPath,
++    );
++    const worker = capture.mock.contexts[openRequestIndex];
++    assert(worker instanceof Worker, "Workboard worker was not opened");
++    worker.emit("error", new Error("database is locked"));
++    await expect(afterAtMostOneRejection(() => stores.boards.lookup("ops"))).resolves.toEqual(
++      board,
++    );
++    await expect(afterAtMostOneRejection(() => sibling.boards.lookup("ops"))).resolves.toEqual(
++      board,
++    );
++    await stores.boards.delete("ops");
++    await expect(stores.boards.lookup("ops")).resolves.toBeUndefined();
++  } finally {
++    capture.mockRestore();
++    await Promise.all([stores.close(), sibling.close()]);
++    await rm(dir, { recursive: true, force: true });
++  }
++}, 30_000);
++
++it("does not reopen the store for a single real database lock", async () => {
++  const dir = await mkdtemp(path.join(os.tmpdir(), "workboard-recovery-"));
++  const dbPath = path.join(dir, "workboard.sqlite");
++  const stores = createWorkboardSqliteStores({ dbPath, workerModuleUrl });
++  const holder = new DatabaseSync(dbPath);
++  try {
++    await stores.ready;
++    await stores.boards.register("ops", board);
++    holder.exec("BEGIN IMMEDIATE");
++    const changed = { ...board, board: { ...board.board, updatedAt: 2 } };
++    await expect(stores.boards.register("ops", changed)).rejects.toMatchObject({ errcode: 5 });
++    holder.exec("ROLLBACK");
++    await stores.boards.register("ops", changed);
++    await expect(stores.boards.lookup("ops")).resolves.toEqual(changed);
++    expect(await stores.dataVersion()).toBeLessThan(1_000_000_000);
++  } finally {
++    holder.close();
++    await stores.close();
++    await rm(dir, { recursive: true, force: true });
++  }
++}, 30_000);
+diff --git a/src/infra/sqlite-worker-broker.ts b/src/infra/sqlite-worker-broker.ts
+index 5127f0d2..8cb2ee8a 100644
+--- a/src/infra/sqlite-worker-broker.ts
++++ b/src/infra/sqlite-worker-broker.ts
+@@ -205,6 +205,11 @@ export class SqliteWorkerBroker {
+     options.signal?.throwIfAborted();
+     options.assertCurrent?.();
+     let actor = this.actors.get(key);
++    if (actor?.slot.failed) {
++      // Retained sibling clients must not pin a failed actor to its dead slot.
++      await waitForSqliteWorkerOpen(this.lifecycle.retireActor(actor), options.signal);
++      return this.openAdmitted(options, client);
++    }
+     let resumeScheduledMaintenance: (() => void) | undefined;
+     if (actor?.retirementRequested || actor?.cleanupState === "pending") {
+       const pending = actor.retirementRequested ? actor.retirement : actor.closing;
+-- 
+2.39.5
+
+
+From f75edc2a90ab63e468d837baa4f9b0c363a81629 Mon Sep 17 00:00:00 2001
+From: "yehezkel-assistant[bot]"
+ <3902212+yehezkel-assistant[bot]@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 14:09:24 +0200
+Subject: [PATCH 2/2] refactor(sqlite-worker): move the reopen-blocked error to
+ admission (temporary, with 3d703ece1e)
+
+3d703ece1e pushed src/infra/sqlite-worker-broker.ts to 702 counted lines, over
+the oxlint max-lines limit of 700. Move the error built for a pending
+retirement or cleanup to sqlite-worker-broker-admission.ts, next to
+assertSqliteWorkerActorReusable. Same message, same code, no behavior change.
+
+TEMPORARY: drop together with 3d703ece1e and c0ba37ed20 once we run a release
+containing openclaw/openclaw#170138.
+---
+ src/infra/sqlite-worker-broker-admission.ts | 10 ++++++++++
+ src/infra/sqlite-worker-broker.ts           |  8 ++------
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/src/infra/sqlite-worker-broker-admission.ts b/src/infra/sqlite-worker-broker-admission.ts
+index c1ee3cef..53b30b69 100644
+--- a/src/infra/sqlite-worker-broker-admission.ts
++++ b/src/infra/sqlite-worker-broker-admission.ts
+@@ -19,6 +19,7 @@ import type {
+   Job,
+   SqliteWorkerOpenCustody,
+ } from "./sqlite-worker-broker.types.js";
++import { SqliteWorkerError } from "./sqlite-worker-contract.js";
+ import { readDatabasePathIdentity, type DatabasePathIdentity } from "./sqlite-worker-identity.js";
+ import { createSqliteWorkerOperationAdmission } from "./sqlite-worker-operation-admission.js";
+ import {
+@@ -340,6 +341,15 @@ function assertSqliteWorkerActorStateContext(
+   }
+ }
+ 
++export function createSqliteWorkerReopenBlockedError(actor: Actor): SqliteWorkerError {
++  return new SqliteWorkerError(
++    actor.retirementRequested
++      ? "SQLite actor retirement must finish before reopening"
++      : "SQLite worker cleanup is pending; retry close before reopening",
++    "closed",
++  );
++}
++
+ export function assertSqliteWorkerActorReusable(
+   actor: Actor,
+   moduleUrl: string,
+diff --git a/src/infra/sqlite-worker-broker.ts b/src/infra/sqlite-worker-broker.ts
+index 8cb2ee8a..99855c42 100644
+--- a/src/infra/sqlite-worker-broker.ts
++++ b/src/infra/sqlite-worker-broker.ts
+@@ -9,6 +9,7 @@ import {
+   assertSqliteWorkerActorReusable,
+   captureSqliteWorkerJobCustody,
+   createSqliteWorkerAdmissionWarning,
++  createSqliteWorkerReopenBlockedError,
+   captureSqliteWorkerOpen,
+   captureSqliteWorkerRuntime,
+   captureSqliteWorkerAdmissionPaths,
+@@ -217,12 +218,7 @@ export class SqliteWorkerBroker {
+         await waitForSqliteWorkerOpen(pending, options.signal);
+         return this.openAdmitted(options, client);
+       }
+-      throw new SqliteWorkerError(
+-        actor.retirementRequested
+-          ? "SQLite actor retirement must finish before reopening"
+-          : "SQLite worker cleanup is pending; retry close before reopening",
+-        "closed",
+-      );
++      throw createSqliteWorkerReopenBlockedError(actor);
+     }
+     if (actor) {
+       if (options.runtimePreparation) {
+-- 
+2.39.5
+
