@@ -1,8 +1,8 @@
-name: One-off fork gate (ee96c670) r2 full-extensions
+name: One-off fork gate (ee96c670) r3 leaf tooling/runtime/agentic
 
 on:
   push:
-    branches: [oneoff/fork-gate-ee96c670-r2]
+    branches: [oneoff/fork-gate-ee96c670-r3]
 
 permissions:
   contents: read
@@ -14,14 +14,14 @@ env:
   SHARDS: 20
 
 jobs:
-  extensions:
-    name: full-extensions plan (${{ matrix.variant }})
+  leaf:
+    name: leaf shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
-        variant: [patched, base]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     steps:
       - uses: actions/checkout@v4
         with: { path: runner }
@@ -33,7 +33,6 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Apply the change under test
-        if: matrix.variant == 'patched'
         working-directory: fork
         run: git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
       - uses: pnpm/action-setup@v4
@@ -42,16 +41,103 @@ jobs:
         with: { node-version: '24.22.1' }
       - name: Install
         working-directory: fork
-        run: pnpm install --frozen-lockfile
-      - name: run plan 11 (full-extensions)
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium || true
+      - name: run leaf slice
         continue-on-error: true
         working-directory: fork
-        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-slice.mts" 0 1 "$RUNNER_TEMP/slice" 11
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" ${{ matrix.shard }} 18 "$RUNNER_TEMP/leaf" full-core-tooling,full-core-runtime,full-agentic
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ext-${{ matrix.variant }}
+          name: leaf-${{ matrix.shard }}
           path: |
-            ${{ runner.temp }}/slice/results.json
-            ${{ runner.temp }}/slice/plan-count.txt
-            ${{ runner.temp }}/slice/plan-11.json
+            ${{ runner.temp }}/leaf/results.json
+            ${{ runner.temp }}/leaf/plan-count.txt
+
+  base-top:
+    name: base rerun of top-level plans 1 and 6
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: runner }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: fork/package.json, run_install: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '24.22.1' }
+      - name: Install
+        working-directory: fork
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium || true
+      - name: rerun plans 1 6 on base
+        continue-on-error: true
+        working-directory: fork
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-slice.mts" 0 1 "$RUNNER_TEMP/base" 1 6
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: base-top
+          path: |
+            ${{ runner.temp }}/base/results.json
+            ${{ runner.temp }}/base/plan-count.txt
+
+  base-leaf:
+    name: base rerun of failed leaf plans
+    needs: leaf
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: leaf-*, path: leaves }
+      - name: Collect
+        id: collect
+        run: |
+          node -e '
+            const fs=require("fs"),path=require("path");const all=[];
+            for(const d of fs.readdirSync("leaves")){const r=path.join("leaves",d,"results.json"); if(fs.existsSync(r)) all.push(...JSON.parse(fs.readFileSync(r)));}
+            const bad=all.filter(e=>e.status!==0);
+            console.log(JSON.stringify({plansRun:all.length,failed:bad},null,1));
+            fs.writeFileSync("failed.txt",bad.map(e=>e.i).join(" "));
+          '
+          echo "failed=$(cat failed.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with: { path: runner }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: fork/package.json, run_install: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '24.22.1' }
+      - name: Install
+        working-directory: fork
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium || true
+      - name: rerun failed leaf plans on base
+        if: steps.collect.outputs.failed != ''
+        continue-on-error: true
+        working-directory: fork
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/base" full-core-tooling,full-core-runtime,full-agentic ${{ steps.collect.outputs.failed }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: base-leaf
+          path: |
+            ${{ runner.temp }}/base/results.json
+            ${{ runner.temp }}/base/plan-count.txt
