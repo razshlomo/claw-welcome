@@ -1,8 +1,8 @@
-name: One-off fork gate (ee96c670) r3 leaf tooling/runtime/agentic
+name: One-off fork gate (ee96c670) r4 leaf extensions
 
 on:
   push:
-    branches: [oneoff/fork-gate-ee96c670-r3]
+    branches: [oneoff/fork-gate-ee96c670-r4]
 
 permissions:
   contents: read
@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v4
         with: { path: runner }
@@ -47,7 +47,7 @@ jobs:
       - name: run leaf slice
         continue-on-error: true
         working-directory: fork
-        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" ${{ matrix.shard }} 18 "$RUNNER_TEMP/leaf" full-core-tooling,full-core-runtime,full-agentic
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" ${{ matrix.shard }} 12 "$RUNNER_TEMP/leaf" full-extensions
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -55,41 +55,6 @@ jobs:
           path: |
             ${{ runner.temp }}/leaf/results.json
             ${{ runner.temp }}/leaf/plan-count.txt
-
-  base-top:
-    name: base rerun of top-level plans 1 and 6
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-        with: { path: runner }
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.FORK_REPO }}
-          ref: ${{ env.BASE_SHA }}
-          path: fork
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: pnpm/action-setup@v4
-        with: { package_json_file: fork/package.json, run_install: false }
-      - uses: actions/setup-node@v4
-        with: { node-version: '24.22.1' }
-      - name: Install
-        working-directory: fork
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium || true
-      - name: rerun plans 1 6 on base
-        continue-on-error: true
-        working-directory: fork
-        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-slice.mts" 0 1 "$RUNNER_TEMP/base" 1 6
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: base-top
-          path: |
-            ${{ runner.temp }}/base/results.json
-            ${{ runner.temp }}/base/plan-count.txt
 
   base-leaf:
     name: base rerun of failed leaf plans
@@ -133,7 +98,7 @@ jobs:
         if: steps.collect.outputs.failed != ''
         continue-on-error: true
         working-directory: fork
-        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/base" full-core-tooling,full-core-runtime,full-agentic ${{ steps.collect.outputs.failed }}
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/base" full-extensions ${{ steps.collect.outputs.failed }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
