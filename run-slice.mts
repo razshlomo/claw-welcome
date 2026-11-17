@@ -37,10 +37,15 @@ for (const i of selected) {
     `--outputFile.json=${json}`,
   ];
   const started = Date.now();
+  // Same per-plan env adjustment test-projects-run applies (8 GB heap for full-extensions).
+  const [{ env }] = support.applyFullExtensionsHeapBudget([{ config: plan.config, env: process.env }], {
+    env: process.env,
+  });
+  console.log(`[slice] plan ${i} ${plan.config} NODE_OPTIONS=${env.NODE_OPTIONS ?? ""}`);
   const run = spawnSync(process.execPath, args, {
     stdio: "inherit",
-    timeout: 60 * 60 * 1000,
-    env: process.env,
+    timeout: 90 * 60 * 1000,
+    env,
   });
   let numTotalTests: number | null = null;
   let numFailedTests: number | null = null;
