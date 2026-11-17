@@ -45,7 +45,7 @@ for (const plan of selected) {
   const started = Date.now();
   const run = spawnSync(process.execPath, args, {
     stdio: "inherit",
-    timeout: 45 * 60 * 1000,
+    timeout: Number(process.env.GATE_PLAN_TIMEOUT_MIN ?? 45) * 60 * 1000,
     env: process.env,
   });
   let numTotalTests: number | null = null;

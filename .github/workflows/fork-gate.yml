@@ -1,8 +1,8 @@
-name: One-off fork gate (ee96c670) r5 codex resident-performance repeat
+name: One-off fork gate (ee96c670) r7 gateway-database-workers plan 575 with a 200 min cap
 
 on:
   push:
-    branches: [oneoff/fork-gate-ee96c670-r5]
+    branches: [oneoff/fork-gate-ee96c670-r7]
 
 permissions:
   contents: read
@@ -13,14 +13,13 @@ env:
 
 jobs:
   repeat:
-    name: plan 624 (${{ matrix.variant }} ${{ matrix.attempt }})
+    name: plan 575 (${{ matrix.variant }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
         variant: [patched, base]
-        attempt: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with: { path: runner }
@@ -42,12 +41,13 @@ jobs:
       - name: Install
         working-directory: fork
         run: pnpm install --frozen-lockfile
-      - name: run plan 624
+      - name: run plan 575
         continue-on-error: true
+        env: { GATE_PLAN_TIMEOUT_MIN: '200' }
         working-directory: fork
-        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/leaf" full-extensions 624
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/leaf" full-core-runtime 575
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rep-${{ matrix.variant }}-${{ matrix.attempt }}
+          name: p575-${{ matrix.variant }}
           path: ${{ runner.temp }}/leaf/results.json
