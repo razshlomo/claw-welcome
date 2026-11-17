@@ -1,0 +1,264 @@
+name: One-off fork gate (ee96c670)
+
+on:
+  push:
+    branches: [oneoff/fork-gate-ee96c670]
+
+permissions:
+  contents: read
+
+env:
+  FORK_REPO: razshlomo/openclaw
+  # fork/2026.10.7 head (merge of PR #9): what the PR will merge into
+  BASE_SHA: ebfa72e66cde27e75860392f0c4df47b35e44027
+  SHARDS: 20
+
+jobs:
+  static:
+    name: static (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, base]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: runner }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Apply the change under test
+        if: matrix.variant == 'patched'
+        working-directory: fork
+        run: |
+          git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
+          git log --oneline -3
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: fork/package.json, run_install: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '24.22.1' }
+      - name: Install
+        working-directory: fork
+        run: pnpm install --frozen-lockfile
+      - name: tsgo core
+        id: tsgo_core
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm tsgo:core
+      - name: tsgo extensions
+        id: tsgo_extensions
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm tsgo:extensions
+      - name: tsgo extensions test
+        id: tsgo_extensions_test
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm tsgo:extensions:test
+      - name: lint
+        id: lint
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm lint 2>&1 | tee "$RUNNER_TEMP/lint.log"; exit ${PIPESTATUS[0]}
+      - name: build
+        id: build
+        continue-on-error: true
+        working-directory: fork
+        run: pnpm build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lint-log-${{ matrix.variant }}
+          path: ${{ runner.temp }}/lint.log
+      - name: Summary
+        run: |
+          {
+            echo "## static (${{ matrix.variant }})"
+            echo "| step | outcome |"
+            echo "|---|---|"
+            echo "| tsgo:core | ${{ steps.tsgo_core.outcome }} |"
+            echo "| tsgo:extensions | ${{ steps.tsgo_extensions.outcome }} |"
+            echo "| tsgo:extensions:test | ${{ steps.tsgo_extensions_test.outcome }} |"
+            echo "| lint | ${{ steps.lint.outcome }} |"
+            echo "| build | ${{ steps.build.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for o in "${{ steps.tsgo_core.outcome }}" "${{ steps.tsgo_extensions.outcome }}" "${{ steps.tsgo_extensions_test.outcome }}" "${{ steps.lint.outcome }}" "${{ steps.build.outcome }}"; do
+            [ "$o" = "success" ] || exit 1
+          done
+
+  acceptance:
+    name: acceptance (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # patched = base + fix + tests; red-on-base = base + the new tests only
+        variant: [patched, red-on-base]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: runner }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Apply
+        working-directory: fork
+        run: |
+          if [ "${{ matrix.variant }}" = patched ]; then
+            git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
+          else
+            git apply --exclude=extensions/whatsapp/src/poll-vote-decode.ts "$GITHUB_WORKSPACE/runner/change.patch"
+          fi
+          git status --short
+          mkdir -p "$RUNNER_TEMP/acc"
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: fork/package.json, run_install: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '24.22.1' }
+      - name: Install
+        working-directory: fork
+        run: pnpm install --frozen-lockfile
+      - name: acceptance command (as written)
+        id: acc
+        continue-on-error: true
+        working-directory: fork
+        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.extension-whatsapp.config.ts extensions/whatsapp/src/poll-vote-decode.test.ts extensions/whatsapp/src/inbound/poll-vote-inbound.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/acc/acceptance.json"
+      - name: inbound test under its owning config
+        id: inbound
+        continue-on-error: true
+        working-directory: fork
+        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.extension-database-workers.config.ts extensions/whatsapp/src/inbound/poll-vote-inbound.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/acc/inbound.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-${{ matrix.variant }}
+          path: ${{ runner.temp }}/acc/
+      - name: Verdict
+        run: |
+          for f in acceptance inbound; do
+            node -e 'const r=require(process.argv[1]);console.log(process.argv[2], JSON.stringify({files:r.testResults.map(t=>t.name.split("/fork/")[1]+":"+t.status), total:r.numTotalTests, failed:r.numFailedTests, passed:r.numPassedTests}))' "$RUNNER_TEMP/acc/$f.json" "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "${{ matrix.variant }}" = patched ]; then
+            [ "${{ steps.acc.outcome }}" = success ] && [ "${{ steps.inbound.outcome }}" = success ]
+          else
+            # red-on-base must fail in both: the fix is absent
+            [ "${{ steps.acc.outcome }}" = failure ] && [ "${{ steps.inbound.outcome }}" = failure ]
+          fi
+
+  test:
+    name: full test shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: runner }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Apply the change under test
+        working-directory: fork
+        run: git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: fork/package.json, run_install: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '24.22.1' }
+      - name: Install
+        working-directory: fork
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium || true
+      - name: run slice
+        id: slice
+        continue-on-error: true
+        working-directory: fork
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-slice.mts" ${{ matrix.shard }} "$SHARDS" "$RUNNER_TEMP/slice"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slice-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/slice/results.json
+            ${{ runner.temp }}/slice/plan-count.txt
+
+  base-rerun:
+    name: rerun failed plans on base
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: runner }
+      - uses: actions/download-artifact@v4
+        with: { pattern: slice-*, path: slices }
+      - name: Collect
+        id: collect
+        run: |
+          node -e '
+            const fs=require("fs"),path=require("path");
+            const all=[];const counts=new Set();
+            for(const d of fs.readdirSync("slices")){
+              const r=path.join("slices",d,"results.json"); if(fs.existsSync(r)) all.push(...JSON.parse(fs.readFileSync(r)));
+              const c=path.join("slices",d,"plan-count.txt"); if(fs.existsSync(c)) counts.add(fs.readFileSync(c,"utf8"));
+            }
+            const bad=all.filter(e=>e.status!==0);
+            const sum=k=>all.reduce((a,e)=>a+(e[k]??0),0);
+            const s={slices:fs.readdirSync("slices").length,planCounts:[...counts],plansRun:all.length,tests:sum("numTotalTests"),failedTests:sum("numFailedTests"),failedPlans:bad.map(e=>({i:e.i,config:e.config,status:e.status,signal:e.signal,failed:e.numFailedTests,files:e.failedFiles}))};
+            fs.writeFileSync("patched-summary.json",JSON.stringify(s,null,1));
+            fs.writeFileSync("failed.txt",bad.map(e=>e.i).join(" "));
+            console.log(JSON.stringify(s,null,1));
+          '
+          echo "failed=$(cat failed.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.collect.outputs.failed != ''
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_SHA }}
+          path: fork
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        if: steps.collect.outputs.failed != ''
+        with: { package_json_file: fork/package.json, run_install: false }
+      - uses: actions/setup-node@v4
+        if: steps.collect.outputs.failed != ''
+        with: { node-version: '24.22.1' }
+      - name: Install base
+        if: steps.collect.outputs.failed != ''
+        working-directory: fork
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium || true
+      - name: rerun on base
+        if: steps.collect.outputs.failed != ''
+        continue-on-error: true
+        working-directory: fork
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-slice.mts" 0 1 "$RUNNER_TEMP/base" ${{ steps.collect.outputs.failed }}
+      - name: stash base results
+        if: always()
+        run: |
+          mkdir -p out; cp patched-summary.json out/ || true
+          cp "$RUNNER_TEMP/base/results.json" out/base-results.json 2>/dev/null || true
+          cp "$RUNNER_TEMP/base/plan-count.txt" out/base-plan-count.txt 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-suite-summary
+          path: out/
