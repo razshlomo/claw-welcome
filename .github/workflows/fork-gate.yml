@@ -1,8 +1,8 @@
-name: One-off fork gate (ee96c670) r5 codex resident-performance repeat
+name: One-off fork gate (ee96c670) r6 base reruns of r3 failed leaf plans (parallel)
 
 on:
   push:
-    branches: [oneoff/fork-gate-ee96c670-r5]
+    branches: [oneoff/fork-gate-ee96c670-r6]
 
 permissions:
   contents: read
@@ -13,14 +13,13 @@ env:
 
 jobs:
   repeat:
-    name: plan 624 (${{ matrix.variant }} ${{ matrix.attempt }})
+    name: base plan ${{ matrix.plan }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        variant: [patched, base]
-        attempt: [1, 2, 3]
+        plan: [303, 483, 187, 116, 592, 575, 160, 528]
     steps:
       - uses: actions/checkout@v4
         with: { path: runner }
@@ -31,23 +30,21 @@ jobs:
           path: fork
           fetch-depth: 1
           persist-credentials: false
-      - name: Apply the change under test
-        if: matrix.variant == 'patched'
-        working-directory: fork
-        run: git -c user.name=gate -c user.email=gate@localhost am "$GITHUB_WORKSPACE/runner/change.patch"
       - uses: pnpm/action-setup@v4
         with: { package_json_file: fork/package.json, run_install: false }
       - uses: actions/setup-node@v4
         with: { node-version: '24.22.1' }
       - name: Install
         working-directory: fork
-        run: pnpm install --frozen-lockfile
-      - name: run plan 624
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium || true
+      - name: run plan on base
         continue-on-error: true
         working-directory: fork
-        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/leaf" full-extensions 624
+        run: node --import ./scripts/tsx.mjs "$GITHUB_WORKSPACE/runner/run-leaf.mts" 0 1 "$RUNNER_TEMP/leaf" full-core-tooling,full-core-runtime,full-agentic ${{ matrix.plan }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rep-${{ matrix.variant }}-${{ matrix.attempt }}
+          name: base-plan-${{ matrix.plan }}
           path: ${{ runner.temp }}/leaf/results.json
